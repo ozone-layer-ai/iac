@@ -3,6 +3,5 @@ output "tunnel_token" {
 }
 
 output "cluster_access_url" {
-  value = "${cloudflare_dns_record.console.name}.${data.cloudflare_zone.this.name}"
-  sensitive = true
+  value = "${cloudflare_dns_record.this.name}.${data.cloudflare_zone.this.name}"
 }

@@ -10,4 +10,5 @@ module "aws" {
 
   cluster = var.cluster
   eip_count = var.cp_ip_count
+  worker_region = var.worker_region
 }

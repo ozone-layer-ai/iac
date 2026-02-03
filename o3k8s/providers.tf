@@ -2,7 +2,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 6.19.0"
+      version = "~> 6.28.0"
     }
     cloudflare = {
       source = "cloudflare/cloudflare"
@@ -11,6 +11,10 @@ terraform {
     env = {
       source = "tchupp/env"
     }
+    null = {
+      source = "hashicorp/null"
+      version = "3.2.4"
+    }
   }
 }
 
@@ -18,6 +22,13 @@ terraform {
 # AWS_SECRET_ACCESS_KEY
 # AWS_REGION
 provider "aws" {}
+
+# AWS_ACCESS_KEY_ID
+# AWS_SECRET_ACCESS_KEY
+provider "aws" {
+  alias = "worker"
+  region = var.worker_region
+}
 
 # CLOUDFLARE_API_TOKEN
 provider "cloudflare" {}

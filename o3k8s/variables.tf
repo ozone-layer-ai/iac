@@ -1,3 +1,5 @@
+variable "orgid" {}
+
 variable "domain" {}
 
 variable "cluster" {}

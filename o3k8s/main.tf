@@ -3,6 +3,7 @@ module "cloudflare" {
 
   domain = var.domain
   cluster = var.cluster
+  orgid = var.orgid
 }
 
 module "aws" {

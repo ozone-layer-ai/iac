@@ -17,3 +17,7 @@ output "private_subnets" {
 output "public_subnets" {
   value = module.vpc.public_subnets
 }
+
+output "nat_gw_ips" {
+  value = module.vpc.nat_public_ips
+}

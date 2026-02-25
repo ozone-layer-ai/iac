@@ -25,3 +25,7 @@ output "private_subnets" {
 output "public_subnets" {
   value = module.aws.public_subnets
 }
+
+output "nat_gw_ips" {
+  value = module.aws.nat_gw_ips
+}

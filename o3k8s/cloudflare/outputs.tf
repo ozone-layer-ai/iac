@@ -7,5 +7,5 @@ locals {
 }
 
 output "cluster_access_url" {
-  value = "${local.cluster_access_url_apex}${data.cloudflare_zone.this.name}"
+  value = "${local.cluster_access_url_apex}.${data.cloudflare_zone.this.name}"
 }

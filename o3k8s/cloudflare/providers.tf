@@ -5,3 +5,6 @@ terraform {
     }
   }
 }
+
+# CLOUDFLARE_API_TOKEN
+provider "cloudflare" {}

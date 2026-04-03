@@ -11,6 +11,14 @@ resource "aws_security_group" "metal_sg" {
     cidr_blocks = [data.aws_vpc.vpc.cidr_block]
   }
 
+  ingress {
+    description = "Cilium VXLAN from VPC"
+    from_port   = 8472
+    to_port     = 8472
+    protocol    = "udp"
+    cidr_blocks = [data.aws_vpc.vpc.cidr_block]
+  }
+
   egress {
     from_port        = 0
     to_port          = 0
@@ -189,7 +197,48 @@ systemctl is-active --quiet libvirtd || systemctl start libvirtd
 # On EC2 ENA, libvirt direct passthrough cannot program MAC on the lower ENI.
 # Use macvtap bridge mode with stable VM MACs, then rewrite L2 headers with tc
 # so frames on-wire always use the ENI MAC required by AWS.
-for i in 1 2 3; do
+VM_COUNT=3
+HOST_RESERVED_VCPUS=4
+HOST_RESERVED_RAM_MB=8192
+HOST_RESERVED_DISK_GB=12
+
+HOST_VCPUS=$(nproc)
+HOST_RAM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+DATA_DISK_BYTES=$(lsblk -bndo SIZE /dev/nvme1n1 2>/dev/null | head -1 || true)
+if [[ -z "$DATA_DISK_BYTES" ]]; then
+  echo "Unable to read /dev/nvme1n1 size; defaulting to 100 GiB for calculations"
+  DATA_DISK_BYTES=$((100 * 1024 * 1024 * 1024))
+fi
+DATA_DISK_GB=$((DATA_DISK_BYTES / 1024 / 1024 / 1024))
+
+USABLE_VCPUS=$((HOST_VCPUS - HOST_RESERVED_VCPUS))
+if (( USABLE_VCPUS < VM_COUNT )); then
+  USABLE_VCPUS=$VM_COUNT
+fi
+
+USABLE_RAM_MB=$((HOST_RAM_MB - HOST_RESERVED_RAM_MB))
+MIN_RAM_MB=$((VM_COUNT * 2048))
+if (( USABLE_RAM_MB < MIN_RAM_MB )); then
+  USABLE_RAM_MB=$MIN_RAM_MB
+fi
+
+USABLE_DISK_GB=$((DATA_DISK_GB - HOST_RESERVED_DISK_GB))
+MIN_DISK_GB=$((VM_COUNT * 20))
+if (( USABLE_DISK_GB < MIN_DISK_GB )); then
+  USABLE_DISK_GB=$MIN_DISK_GB
+fi
+
+BASE_VCPUS=$((USABLE_VCPUS / VM_COUNT))
+EXTRA_VCPUS=$((USABLE_VCPUS % VM_COUNT))
+BASE_RAM_MB=$((USABLE_RAM_MB / VM_COUNT))
+EXTRA_RAM_MB=$((USABLE_RAM_MB % VM_COUNT))
+BASE_DISK_GB=$((USABLE_DISK_GB / VM_COUNT))
+EXTRA_DISK_GB=$((USABLE_DISK_GB % VM_COUNT))
+
+echo "Host detected: vcpus=$HOST_VCPUS ram_mb=$HOST_RAM_MB data_disk_gb=$DATA_DISK_GB"
+echo "Worker sizing plan: usable_vcpus=$USABLE_VCPUS usable_ram_mb=$USABLE_RAM_MB usable_disk_gb=$USABLE_DISK_GB"
+
+for i in $(seq 1 "$VM_COUNT"); do
   ETH="eth$i"
   for _ in $(seq 1 90); do
     if ip link show "$ETH" >/dev/null 2>&1; then
@@ -216,9 +265,22 @@ done
 pkill -f qemu-system-x86_64 || true
 systemctl restart libvirtd
 
-for i in 1 2 3; do
+for i in $(seq 1 "$VM_COUNT"); do
   VM="worker-$i"
   ETH="eth$i"
+  VM_INDEX=$((i - 1))
+  VM_VCPUS=$BASE_VCPUS
+  VM_RAM_MB=$BASE_RAM_MB
+  VM_DISK_GB=$BASE_DISK_GB
+  if (( VM_INDEX < EXTRA_VCPUS )); then
+    VM_VCPUS=$((VM_VCPUS + 1))
+  fi
+  if (( VM_INDEX < EXTRA_RAM_MB )); then
+    VM_RAM_MB=$((VM_RAM_MB + 1))
+  fi
+  if (( VM_INDEX < EXTRA_DISK_GB )); then
+    VM_DISK_GB=$((VM_DISK_GB + 1))
+  fi
   VM_MAC=$(printf '52:54:00:aa:bb:%02x' "$i")
   ENI_MAC=$(ip link show "$ETH" | awk '/link\/ether/ {print $2; exit}')
   NEED_CREATE=1
@@ -229,7 +291,15 @@ for i in 1 2 3; do
 
   if virsh dominfo "$VM" >/dev/null 2>&1; then
     EXISTING_MAC=$(virsh domiflist "$VM" | grep -Eo '([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}' | head -1)
-    if [[ "$EXISTING_MAC" != "$VM_MAC" ]]; then
+    CURRENT_VCPUS=$(virsh dominfo "$VM" | awk -F': +' '/CPU\(s\)/ {print $2; exit}')
+    CURRENT_RAM_KIB=$(virsh dominfo "$VM" | awk -F': +' '/Max memory/ {print $2; exit}' | awk '{print $1}')
+    CURRENT_RAM_MB=$((CURRENT_RAM_KIB / 1024))
+    CURRENT_DISK_BYTES=$(virsh domblkinfo "$VM" vda 2>/dev/null | awk -F': +' '/Capacity/ {print $2; exit}')
+    if [[ -z "$CURRENT_DISK_BYTES" ]]; then
+      CURRENT_DISK_BYTES=0
+    fi
+    CURRENT_DISK_GB=$((CURRENT_DISK_BYTES / 1024 / 1024 / 1024))
+    if [[ "$EXISTING_MAC" != "$VM_MAC" || "$CURRENT_VCPUS" != "$VM_VCPUS" || "$CURRENT_RAM_MB" != "$VM_RAM_MB" || "$CURRENT_DISK_GB" -lt "$VM_DISK_GB" ]]; then
       virsh destroy "$VM" >/dev/null 2>&1 || true
       virsh undefine "$VM" --remove-all-storage --nvram >/dev/null 2>&1 || true
     else
@@ -238,12 +308,13 @@ for i in 1 2 3; do
   fi
 
   if [[ "$NEED_CREATE" -eq 1 ]]; then
+    echo "Creating $VM with vcpus=$VM_VCPUS ram_mb=$VM_RAM_MB disk_gb=$VM_DISK_GB on $ETH"
     for attempt in 1 2 3 4 5; do
       if virt-install \
         --name "$VM" \
-        --ram 4096 \
-        --vcpus 2 \
-        --disk path="/var/lib/libvirt/images/$VM.qcow2",size=40,format=qcow2,bus=virtio \
+        --ram "$VM_RAM_MB" \
+        --vcpus "$VM_VCPUS" \
+        --disk path="/var/lib/libvirt/images/$VM.qcow2",size="$VM_DISK_GB",format=qcow2,bus=virtio \
         --os-variant generic \
         --noautoconsole \
         --graphics none \
@@ -265,7 +336,7 @@ for i in 1 2 3; do
   fi
 done
 
-for i in 1 2 3; do
+for i in $(seq 1 "$VM_COUNT"); do
   VM="worker-$i"
   ETH="eth$i"
   VM_MAC=$(virsh domiflist "$VM" | grep -Eo '([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}' | head -1)

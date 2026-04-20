@@ -13,3 +13,9 @@ variable "subnet_id" {
 variable "iam_instance_profile_name" {
   default = "EC2forSSMRole"
 }
+
+variable "force_recreate_worker_vms" {
+  description = "When true, recreates worker VMs and their qcow2 disks on host bootstrap to guarantee clean node storage."
+  type        = bool
+  default     = true
+}

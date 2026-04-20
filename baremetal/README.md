@@ -17,8 +17,11 @@ After `terraform apply`, user-data now does all bootstrap steps on the EC2 host:
 5. Installs and starts `metal3-create-vms.service` (oneshot), which:
    - waits for `eth1..eth3`,
    - removes host-side DHCP/IP/routes from `eth1..eth3`,
+   - recreates `worker-1..3` and their qcow2 disks on bootstrap by default (`force_recreate_worker_vms=true`),
    - creates `worker-1..3` with direct/macvtap `source_mode=bridge`,
-   - applies `tc` MAC rewrite rules (`vm_mac <-> eni_mac`) per ENI.
+   - attaches two virtio disks per VM: `vda` (root) and `vdb` (data, intended for Ceph OSD),
+   - applies `tc` MAC rewrite rules (`vm_mac <-> eni_mac`) per ENI,
+   - enables host-side proxy ARP + `/32` routing between worker ENIs to emulate inter-node L2 reachability inside AWS VPC.
 
 No extra manual EC2 configuration is required after apply for the host bootstrap itself.
 
@@ -68,6 +71,18 @@ for i in 1 2 3; do
 done
 ```
 
+Inter-node relay checks (required for kubelet/Cilium node reachability):
+
+```bash
+sudo sysctl net.ipv4.ip_forward
+for i in 1 2 3; do
+  echo "=== eth$i proxy_arp ==="
+  sudo sysctl net.ipv4.conf.eth$i.proxy_arp
+done
+sudo ip route | grep -E '/32 dev eth[123]'
+sudo ip neigh show proxy
+```
+
 BMH note:
 - Use VM MACs (`virsh domiflist worker-*`) for `bootMACAddress`.
 - Keep ENI MACs for host-side/network troubleshooting only.
@@ -98,6 +113,12 @@ Manual equivalent (only for debugging; service is preferred):
 
 ```bash
 sudo /usr/local/bin/metal3-create-vms.sh
+```
+
+If you want to keep existing worker disks during bootstrap, set:
+
+```hcl
+force_recreate_worker_vms = false
 ```
 
 The EC2 commands used during troubleshooting (`aws ssm send-command`, `virt-cat`, `libguestfs-tools-c`) are diagnostic-only and are not part of required day-0 bootstrap.

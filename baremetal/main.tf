@@ -201,6 +201,9 @@ VM_COUNT=3
 HOST_RESERVED_VCPUS=4
 HOST_RESERVED_RAM_MB=8192
 HOST_RESERVED_DISK_GB=12
+VM_ROOT_DISK_GB=20
+VM_DATA_DISK_GB_MIN=10
+FORCE_RECREATE_WORKERS=${var.force_recreate_worker_vms}
 
 HOST_VCPUS=$(nproc)
 HOST_RAM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
@@ -223,7 +226,7 @@ if (( USABLE_RAM_MB < MIN_RAM_MB )); then
 fi
 
 USABLE_DISK_GB=$((DATA_DISK_GB - HOST_RESERVED_DISK_GB))
-MIN_DISK_GB=$((VM_COUNT * 20))
+MIN_DISK_GB=$((VM_COUNT * (VM_ROOT_DISK_GB + VM_DATA_DISK_GB_MIN)))
 if (( USABLE_DISK_GB < MIN_DISK_GB )); then
   USABLE_DISK_GB=$MIN_DISK_GB
 fi
@@ -271,7 +274,7 @@ for i in $(seq 1 "$VM_COUNT"); do
   VM_INDEX=$((i - 1))
   VM_VCPUS=$BASE_VCPUS
   VM_RAM_MB=$BASE_RAM_MB
-  VM_DISK_GB=$BASE_DISK_GB
+  VM_TOTAL_DISK_GB=$BASE_DISK_GB
   if (( VM_INDEX < EXTRA_VCPUS )); then
     VM_VCPUS=$((VM_VCPUS + 1))
   fi
@@ -279,11 +282,24 @@ for i in $(seq 1 "$VM_COUNT"); do
     VM_RAM_MB=$((VM_RAM_MB + 1))
   fi
   if (( VM_INDEX < EXTRA_DISK_GB )); then
-    VM_DISK_GB=$((VM_DISK_GB + 1))
+    VM_TOTAL_DISK_GB=$((VM_TOTAL_DISK_GB + 1))
+  fi
+  VM_DATA_DISK_GB=$((VM_TOTAL_DISK_GB - VM_ROOT_DISK_GB))
+  if (( VM_DATA_DISK_GB < VM_DATA_DISK_GB_MIN )); then
+    VM_DATA_DISK_GB=$VM_DATA_DISK_GB_MIN
   fi
   VM_MAC=$(printf '52:54:00:aa:bb:%02x' "$i")
   ENI_MAC=$(ip link show "$ETH" | awk '/link\/ether/ {print $2; exit}')
   NEED_CREATE=1
+  if [[ "$FORCE_RECREATE_WORKERS" == "true" ]]; then
+    if virsh dominfo "$VM" >/dev/null 2>&1; then
+      echo "FORCE_RECREATE_WORKERS=true: replacing $VM and attached disks"
+      virsh destroy "$VM" >/dev/null 2>&1 || true
+      virsh undefine "$VM" --remove-all-storage --nvram >/dev/null 2>&1 || true
+    fi
+    # Remove stale image files left behind by previous failed runs.
+    rm -f "/var/lib/libvirt/images/$VM.qcow2" "/var/lib/libvirt/images/$VM-data.qcow2"
+  fi
   if [[ -z "$ENI_MAC" ]]; then
     echo "Missing MAC for $ETH" >&2
     exit 1
@@ -294,12 +310,17 @@ for i in $(seq 1 "$VM_COUNT"); do
     CURRENT_VCPUS=$(virsh dominfo "$VM" | awk -F': +' '/CPU\(s\)/ {print $2; exit}')
     CURRENT_RAM_KIB=$(virsh dominfo "$VM" | awk -F': +' '/Max memory/ {print $2; exit}' | awk '{print $1}')
     CURRENT_RAM_MB=$((CURRENT_RAM_KIB / 1024))
-    CURRENT_DISK_BYTES=$(virsh domblkinfo "$VM" vda 2>/dev/null | awk -F': +' '/Capacity/ {print $2; exit}')
-    if [[ -z "$CURRENT_DISK_BYTES" ]]; then
-      CURRENT_DISK_BYTES=0
+    CURRENT_ROOT_DISK_BYTES=$(virsh domblkinfo "$VM" vda 2>/dev/null | awk -F': +' '/Capacity/ {print $2; exit}' || true)
+    if [[ -z "$CURRENT_ROOT_DISK_BYTES" ]]; then
+      CURRENT_ROOT_DISK_BYTES=0
     fi
-    CURRENT_DISK_GB=$((CURRENT_DISK_BYTES / 1024 / 1024 / 1024))
-    if [[ "$EXISTING_MAC" != "$VM_MAC" || "$CURRENT_VCPUS" != "$VM_VCPUS" || "$CURRENT_RAM_MB" != "$VM_RAM_MB" || "$CURRENT_DISK_GB" -lt "$VM_DISK_GB" ]]; then
+    CURRENT_ROOT_DISK_GB=$((CURRENT_ROOT_DISK_BYTES / 1024 / 1024 / 1024))
+    CURRENT_DATA_DISK_BYTES=$(virsh domblkinfo "$VM" vdb 2>/dev/null | awk -F': +' '/Capacity/ {print $2; exit}' || true)
+    if [[ -z "$CURRENT_DATA_DISK_BYTES" ]]; then
+      CURRENT_DATA_DISK_BYTES=0
+    fi
+    CURRENT_DATA_DISK_GB=$((CURRENT_DATA_DISK_BYTES / 1024 / 1024 / 1024))
+    if [[ "$EXISTING_MAC" != "$VM_MAC" || "$CURRENT_VCPUS" != "$VM_VCPUS" || "$CURRENT_RAM_MB" != "$VM_RAM_MB" || "$CURRENT_ROOT_DISK_GB" -lt "$VM_ROOT_DISK_GB" || "$CURRENT_DATA_DISK_GB" -lt "$VM_DATA_DISK_GB" ]]; then
       virsh destroy "$VM" >/dev/null 2>&1 || true
       virsh undefine "$VM" --remove-all-storage --nvram >/dev/null 2>&1 || true
     else
@@ -308,13 +329,14 @@ for i in $(seq 1 "$VM_COUNT"); do
   fi
 
   if [[ "$NEED_CREATE" -eq 1 ]]; then
-    echo "Creating $VM with vcpus=$VM_VCPUS ram_mb=$VM_RAM_MB disk_gb=$VM_DISK_GB on $ETH"
+    echo "Creating $VM with vcpus=$VM_VCPUS ram_mb=$VM_RAM_MB root_disk_gb=$VM_ROOT_DISK_GB data_disk_gb=$VM_DATA_DISK_GB on $ETH"
     for attempt in 1 2 3 4 5; do
       if virt-install \
         --name "$VM" \
         --ram "$VM_RAM_MB" \
         --vcpus "$VM_VCPUS" \
-        --disk path="/var/lib/libvirt/images/$VM.qcow2",size="$VM_DISK_GB",format=qcow2,bus=virtio \
+        --disk path="/var/lib/libvirt/images/$VM.qcow2",size="$VM_ROOT_DISK_GB",format=qcow2,bus=virtio \
+        --disk path="/var/lib/libvirt/images/$VM-data.qcow2",size="$VM_DATA_DISK_GB",format=qcow2,bus=virtio \
         --os-variant generic \
         --noautoconsole \
         --graphics none \
@@ -353,6 +375,45 @@ for i in $(seq 1 "$VM_COUNT"); do
   tc filter add dev "$ETH" ingress protocol all flower \
     dst_mac "$ENI_MAC" \
     action pedit ex munge eth dst set "$VM_MAC"
+done
+
+# AWS VPC does not provide true L2 adjacency between these ENIs. Each worker VM
+# can reach the gateway but cannot ARP peer worker IPs directly. Teach the host
+# to proxy ARP and route /32 node IPs between eth1..eth3 so kubelet and Cilium
+# node-to-node traffic can flow.
+VM_NODE_IPS=(
+  "${aws_network_interface.worker[0].private_ip}"
+  "${aws_network_interface.worker[1].private_ip}"
+  "${aws_network_interface.worker[2].private_ip}"
+)
+
+cat > /etc/sysctl.d/99-metal3-worker-routing.conf <<'SYSCTL'
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+SYSCTL
+sysctl --system >/dev/null
+
+for i in $(seq 1 "$VM_COUNT"); do
+  ETH="eth$i"
+  VM_IP="$${VM_NODE_IPS[$((i - 1))]}"
+  ip route replace "$VM_IP/32" dev "$ETH"
+  sysctl -w "net.ipv4.conf.$ETH.rp_filter=0" >/dev/null
+  sysctl -w "net.ipv4.conf.$ETH.proxy_arp=1" >/dev/null
+done
+
+for i in $(seq 1 "$VM_COUNT"); do
+  SRC_ETH="eth$i"
+  for j in $(seq 1 "$VM_COUNT"); do
+    if [[ "$i" -eq "$j" ]]; then
+      continue
+    fi
+    DST_ETH="eth$j"
+    PEER_IP="$${VM_NODE_IPS[$((j - 1))]}"
+    ip neigh replace proxy "$PEER_IP" dev "$SRC_ETH" || true
+    iptables -C FORWARD -i "$SRC_ETH" -o "$DST_ETH" -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -i "$SRC_ETH" -o "$DST_ETH" -j ACCEPT
+  done
 done
 VMBOOTSTRAP
 
